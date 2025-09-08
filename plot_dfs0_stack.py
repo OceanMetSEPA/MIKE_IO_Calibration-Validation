@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from bokeh.plotting import figure, show
 from bokeh.layouts import column
-from bokeh.models import HoverTool, DatetimeTickFormatter, ColumnDataSource
+from bokeh.models import HoverTool, DatetimeTickFormatter, ColumnDataSource, Range1d
 from bokeh.embed import file_html
 from bokeh.resources import INLINE
 import webbrowser
@@ -73,6 +73,126 @@ def _find_item_index_exact(ds, item_name: str):
     raise ValueError(f"Item '{item_name}' not found. Available: {available}")
 
 
+
+def _unit_to_display(unit):
+    """Return a human-friendly unit string from a MIKE IO EUMUnit-like object.
+
+    Tries, in order:
+      1) symbolic/unit fields (unit, symbol, abbr, abbreviation)
+      2) descriptive fields (name, description) — converts snake_case to words
+      3) if it's an int/code (or enum with .value/.code), attempts to resolve via mikeio.eum
+      4) falls back to str(unit)
+    """
+    if unit in (None, "", "None"):
+        return ""
+
+    for attr in ("unit", "symbol", "abbr", "abbreviation"):
+        val = getattr(unit, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val
+
+    name = getattr(unit, "name", None) or getattr(unit, "description", None)
+    if isinstance(name, str) and name.strip():
+        return name.replace("_", " ")
+
+    code = None
+    if isinstance(unit, (int, np.integer)):
+        code = int(unit)
+    elif isinstance(unit, str) and unit.isdigit():
+        code = int(unit)
+    else:
+        for attr in ("value", "code"):
+            v = getattr(unit, attr, None)
+            if isinstance(v, (int, np.integer)):
+                code = int(v)
+                break
+
+    if isinstance(code, int):
+        try:
+            import mikeio  # optional; only if available
+            eum = getattr(mikeio, "eum", None)
+            if eum is not None:
+                UnitCls = getattr(eum, "EUMUnit", None) or getattr(eum, "Unit", None)
+                if UnitCls is not None:
+                    resolver = None
+                    if hasattr(UnitCls, "from_int"):
+                        resolver = getattr(UnitCls, "from_int")
+                    elif hasattr(UnitCls, "from_value"):
+                        resolver = getattr(UnitCls, "from_value")
+                    if resolver is not None:
+                        u = resolver(code)
+                        for attr in ("unit", "symbol", "abbr", "abbreviation", "name", "description"):
+                            val = getattr(u, attr, None)
+                            if isinstance(val, str) and val.strip():
+                                return val.replace("_", " ")
+                        return str(u)
+        except Exception:
+            pass
+
+    return str(unit)
+
+
+def _is_radian_unit(unit):
+    """Heuristically detect whether a MIKE IO unit represents *radians*.
+
+    Uses the resolved display string from `_unit_to_display` and common attributes.
+    """
+    disp = str(_unit_to_display(unit)).strip().lower()
+    if disp in {"rad", "radian", "radians"} or "radian" in disp:
+        return True
+    for attr in ("unit", "symbol", "abbr", "abbreviation", "name", "description"):
+        v = getattr(unit, attr, None)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in {"rad", "radian", "radians"} or "radian" in s:
+                return True
+    return False
+
+
+def _convert_direction_if_radian(y, unit):
+    """If `unit` is radians, convert `y` to degrees and return (y_deg, "°").
+    Otherwise return (y, human_friendly_unit).
+    """
+    if _is_radian_unit(unit):
+        return np.degrees(y), "°"
+    return y, _unit_to_display(unit)
+
+
+def _normalize_angle_unit_label(label: str) -> str:
+    """Normalize any degree-like label to a degree symbol so grouping works.
+
+    Examples: "deg", "degree", "degrees", and "°" -> "°"
+    """
+    s = (label or "").strip().lower()
+    if "deg" in s or "degree" in s or (label and "°" in label):
+        return "°"
+    return label
+
+
+
+def _base_item_name(name: str) -> str:
+    """Return a normalized base item name (e.g., drop station prefixes like 'sur:' )."""
+    if not isinstance(name, str):
+        return str(name)
+    core = name.split(":", 1)[1] if ":" in name else name
+    return core.strip().lower()
+
+
+def _canonical_group_key(ds, idx: int, item_name: str, unit_label: str):
+    """Build a grouping key so *identical plotting items* share y-axis.
+
+    Preference order: explicit MIKE item type if available, else normalized name.
+    Unit is included to avoid grouping items that happen to share the same name
+    but have different units.
+    """
+    it = ds.items[idx]
+    for attr in ("type", "eum_item", "eumType", "quantity", "parameter"):
+        v = getattr(it, attr, None)
+        if v is not None:
+            return (str(v).lower(), unit_label)
+    return (_base_item_name(item_name), unit_label)
+
+
 def plot_dfs0_items_stacked(
     ds,
     item_names,                 # list of exact item names
@@ -120,21 +240,54 @@ def plot_dfs0_items_stacked(
 
     t, arr = _time_and_matrix(ds)
 
+    # Precompute indices and series; detect radians and convert to degrees; compute unit labels
+    indices = [_find_item_index_exact(ds, nm) for nm in item_names]
+    ys = []
+    unit_labels = []
+    for i in indices:
+        unit_raw = getattr(ds.items[i], "unit", "")
+        y_raw = arr[:, i]
+        y_conv, unit_str = _convert_direction_if_radian(y_raw, unit_raw)
+        ys.append(y_conv)
+        unit_labels.append(_normalize_angle_unit_label(unit_str))
+
+    # Build grouping key per series (identical plotting items share y-axis)
+    keys = []
+    groups = {}
+    for k, i in enumerate(indices):
+        key = _canonical_group_key(ds, i, item_names[k], unit_labels[k])
+        keys.append(key)
+        groups.setdefault(key, []).append(k)
+
+    # Compute a shared y-range for each group
+    group_ranges = {}
+    for key, members in groups.items():
+        try:
+            gmin = float(np.nanmin([np.nanmin(ys[m]) for m in members]))
+            gmax = float(np.nanmax([np.nanmax(ys[m]) for m in members]))
+        except ValueError:
+            gmin, gmax = 0.0, 1.0
+        if not np.isfinite(gmin) or not np.isfinite(gmax):
+            gmin, gmax = 0.0, 1.0
+        if gmin == gmax:
+            gmin -= 0.5
+            gmax += 0.5
+        pad = (gmax - gmin) * 0.05
+        group_ranges[key] = Range1d(start=gmin - pad, end=gmax + pad)
+
     figs = []
     shared_x = None
 
     n_plots = len(item_names)
 
     for k, name in enumerate(item_names):
-        idx = _find_item_index_exact(ds, name)
-        y = arr[:, idx]
+        idx = indices[k]
+        y = ys[k]
 
-        # Unit handling
-        unit = getattr(ds.items[idx], "unit", "")
-        unit_str = "" if unit in (None, "", "None") else str(unit)
+        # Unit already resolved (and converted to degrees if needed)
+        unit_str = unit_labels[k]
         title = name if not unit_str else f"{name} ({unit_str})"
-
-                # Decide height: stretch when None
+        # Decide height: stretch when None
         eff_height = height_per_plot if height_per_plot is not None else min_height_per_plot
         p = figure(
             title=title,
@@ -161,6 +314,10 @@ def plot_dfs0_items_stacked(
             shared_x = p.x_range
         else:
             p.x_range = shared_x  # link x-axes
+
+        # Assign group-shared y-range for identical items
+        grp_key = keys[k]
+        p.y_range = group_ranges[grp_key]
 
         # Explicit ColumnDataSource for robust hover
         source = ColumnDataSource(data={"x": t, "y": y})
