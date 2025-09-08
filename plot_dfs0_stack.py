@@ -132,6 +132,7 @@ def _unit_to_display(unit):
     return str(unit)
 
 
+<<<<<<< HEAD
 def _is_radian_unit(unit):
     """Heuristically detect whether a MIKE IO unit represents *radians*.
 
@@ -193,6 +194,8 @@ def _canonical_group_key(ds, idx: int, item_name: str, unit_label: str):
     return (_base_item_name(item_name), unit_label)
 
 
+=======
+>>>>>>> origin/master
 def plot_dfs0_items_stacked(
     ds,
     item_names,                 # list of exact item names
@@ -240,6 +243,7 @@ def plot_dfs0_items_stacked(
 
     t, arr = _time_and_matrix(ds)
 
+<<<<<<< HEAD
     # Precompute indices and series; detect radians and convert to degrees; compute unit labels
     indices = [_find_item_index_exact(ds, nm) for nm in item_names]
     ys = []
@@ -274,6 +278,26 @@ def plot_dfs0_items_stacked(
             gmax += 0.5
         pad = (gmax - gmin) * 0.05
         group_ranges[key] = Range1d(start=gmin - pad, end=gmax + pad)
+=======
+    # Precompute indices and series; compute a global y-range
+    indices = [_find_item_index_exact(ds, nm) for nm in item_names]
+    ys = [arr[:, i] for i in indices]
+
+    # Global y-range across all selected items (ignore NaNs)
+    try:
+        y_min = float(np.nanmin([np.nanmin(y) for y in ys]))
+        y_max = float(np.nanmax([np.nanmax(y) for y in ys]))
+    except ValueError:
+        y_min, y_max = 0.0, 1.0  # handle all-NaN case safely
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        y_min, y_max = 0.0, 1.0
+    if y_min == y_max:
+        # avoid zero-height range
+        y_min -= 0.5
+        y_max += 0.5
+    padding = (y_max - y_min) * 0.05
+    shared_y = None
+>>>>>>> origin/master
 
     figs = []
     shared_x = None
@@ -284,10 +308,19 @@ def plot_dfs0_items_stacked(
         idx = indices[k]
         y = ys[k]
 
+<<<<<<< HEAD
         # Unit already resolved (and converted to degrees if needed)
         unit_str = unit_labels[k]
         title = name if not unit_str else f"{name} ({unit_str})"
         # Decide height: stretch when None
+=======
+        # Unit handling (MIKE IO may expose a numeric code; resolve to display string)
+        unit_raw = getattr(ds.items[idx], "unit", "")
+        unit_str = _unit_to_display(unit_raw)
+        title = name if not unit_str else f"{name} ({unit_str})"
+
+            # Decide height: stretch when None
+>>>>>>> origin/master
         eff_height = height_per_plot if height_per_plot is not None else min_height_per_plot
         p = figure(
             title=title,
@@ -315,9 +348,18 @@ def plot_dfs0_items_stacked(
         else:
             p.x_range = shared_x  # link x-axes
 
+<<<<<<< HEAD
         # Assign group-shared y-range for identical items
         grp_key = keys[k]
         p.y_range = group_ranges[grp_key]
+=======
+        # Link y-axes to a common global range
+        if shared_y is None:
+            shared_y = Range1d(start=y_min - padding, end=y_max + padding)
+            p.y_range = shared_y
+        else:
+            p.y_range = shared_y
+>>>>>>> origin/master
 
         # Explicit ColumnDataSource for robust hover
         source = ColumnDataSource(data={"x": t, "y": y})
