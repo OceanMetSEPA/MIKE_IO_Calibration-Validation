@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from bokeh.plotting import figure, show
 from bokeh.layouts import column
-from bokeh.models import HoverTool, DatetimeTickFormatter, ColumnDataSource
+from bokeh.models import HoverTool, DatetimeTickFormatter, ColumnDataSource, Range1d
 from bokeh.embed import file_html
 from bokeh.resources import INLINE
 import webbrowser
@@ -73,6 +73,65 @@ def _find_item_index_exact(ds, item_name: str):
     raise ValueError(f"Item '{item_name}' not found. Available: {available}")
 
 
+
+def _unit_to_display(unit):
+    """Return a human-friendly unit string from a MIKE IO EUMUnit-like object.
+
+    Tries, in order:
+      1) symbolic/unit fields (unit, symbol, abbr, abbreviation)
+      2) descriptive fields (name, description) — converts snake_case to words
+      3) if it's an int/code (or enum with .value/.code), attempts to resolve via mikeio.eum
+      4) falls back to str(unit)
+    """
+    if unit in (None, "", "None"):
+        return ""
+
+    for attr in ("unit", "symbol", "abbr", "abbreviation"):
+        val = getattr(unit, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val
+
+    name = getattr(unit, "name", None) or getattr(unit, "description", None)
+    if isinstance(name, str) and name.strip():
+        return name.replace("_", " ")
+
+    code = None
+    if isinstance(unit, (int, np.integer)):
+        code = int(unit)
+    elif isinstance(unit, str) and unit.isdigit():
+        code = int(unit)
+    else:
+        for attr in ("value", "code"):
+            v = getattr(unit, attr, None)
+            if isinstance(v, (int, np.integer)):
+                code = int(v)
+                break
+
+    if isinstance(code, int):
+        try:
+            import mikeio  # optional; only if available
+            eum = getattr(mikeio, "eum", None)
+            if eum is not None:
+                UnitCls = getattr(eum, "EUMUnit", None) or getattr(eum, "Unit", None)
+                if UnitCls is not None:
+                    resolver = None
+                    if hasattr(UnitCls, "from_int"):
+                        resolver = getattr(UnitCls, "from_int")
+                    elif hasattr(UnitCls, "from_value"):
+                        resolver = getattr(UnitCls, "from_value")
+                    if resolver is not None:
+                        u = resolver(code)
+                        for attr in ("unit", "symbol", "abbr", "abbreviation", "name", "description"):
+                            val = getattr(u, attr, None)
+                            if isinstance(val, str) and val.strip():
+                                return val.replace("_", " ")
+                        return str(u)
+        except Exception:
+            pass
+
+    return str(unit)
+
+
 def plot_dfs0_items_stacked(
     ds,
     item_names,                 # list of exact item names
@@ -120,21 +179,40 @@ def plot_dfs0_items_stacked(
 
     t, arr = _time_and_matrix(ds)
 
+    # Precompute indices and series; compute a global y-range
+    indices = [_find_item_index_exact(ds, nm) for nm in item_names]
+    ys = [arr[:, i] for i in indices]
+
+    # Global y-range across all selected items (ignore NaNs)
+    try:
+        y_min = float(np.nanmin([np.nanmin(y) for y in ys]))
+        y_max = float(np.nanmax([np.nanmax(y) for y in ys]))
+    except ValueError:
+        y_min, y_max = 0.0, 1.0  # handle all-NaN case safely
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        y_min, y_max = 0.0, 1.0
+    if y_min == y_max:
+        # avoid zero-height range
+        y_min -= 0.5
+        y_max += 0.5
+    padding = (y_max - y_min) * 0.05
+    shared_y = None
+
     figs = []
     shared_x = None
 
     n_plots = len(item_names)
 
     for k, name in enumerate(item_names):
-        idx = _find_item_index_exact(ds, name)
-        y = arr[:, idx]
+        idx = indices[k]
+        y = ys[k]
 
-        # Unit handling
-        unit = getattr(ds.items[idx], "unit", "")
-        unit_str = "" if unit in (None, "", "None") else str(unit)
+        # Unit handling (MIKE IO may expose a numeric code; resolve to display string)
+        unit_raw = getattr(ds.items[idx], "unit", "")
+        unit_str = _unit_to_display(unit_raw)
         title = name if not unit_str else f"{name} ({unit_str})"
 
-                # Decide height: stretch when None
+            # Decide height: stretch when None
         eff_height = height_per_plot if height_per_plot is not None else min_height_per_plot
         p = figure(
             title=title,
@@ -161,6 +239,13 @@ def plot_dfs0_items_stacked(
             shared_x = p.x_range
         else:
             p.x_range = shared_x  # link x-axes
+
+        # Link y-axes to a common global range
+        if shared_y is None:
+            shared_y = Range1d(start=y_min - padding, end=y_max + padding)
+            p.y_range = shared_y
+        else:
+            p.y_range = shared_y
 
         # Explicit ColumnDataSource for robust hover
         source = ColumnDataSource(data={"x": t, "y": y})
