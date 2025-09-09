@@ -195,8 +195,10 @@ def _canonical_group_key(ds, idx: int, item_name: str, unit_label: str):
 
 def plot_dfs0_items_stacked(
     ds,
-    item_names,                 # list of exact item names
+    item_names=None,                # list of exact item names (optional if panels provided)
     *,
+    panels=None,                # optional: list of lists of item names per panel
+
     line_width=1.0,
     sizing_mode="stretch_both",   # fill the window
     height_per_plot=None,          # None => stretch to fill; else fixed height
@@ -217,7 +219,8 @@ def plot_dfs0_items_stacked(
     Parameters
     ----------
     ds : mikeio.Dataset (already loaded)
-    item_names : list[str]   Exact item names to plot (one per subplot)
+    item_names : list[str] | None  Exact item names to plot (one per subplot). Optional if `panels` is provided; ignored when `panels` is used.
+    panels : list[list[str]]  Items per panel; each inner list is plotted together in a single subplot. All items within a panel must represent the same quantity and unit (after conversions).
     line_width : float       Line thickness
     sizing_mode : str        Use "stretch_both" to fill the browser window
     height_per_plot : int|None  If None (default), plots stretch to fill; set a number to fix heights
@@ -231,15 +234,25 @@ def plot_dfs0_items_stacked(
     axis_label_font_size : str Initial axis label font size (e.g., "12pt")
     tick_label_font_size : str Initial tick label font size (e.g., "10pt")
     """
-    if not item_names:
-        raise ValueError("item_names cannot be empty")
-    if len(set(item_names)) != len(item_names):
-        dupes = sorted({n for n in item_names if item_names.count(n) > 1})
-        raise ValueError(f"Duplicate item_names not allowed: {dupes}")
+    # Resolve panel definitions
+    if panels is not None:
+        if not isinstance(panels, (list, tuple)) or not all(isinstance(g, (list, tuple)) and len(g) > 0 for g in panels):
+            raise ValueError("`panels` must be a list of non-empty lists of item names")
+        panel_defs = [list(map(str, g)) for g in panels]
+    else:
+        if not item_names:
+            raise ValueError("item_names cannot be empty")
+        panel_defs = [[nm] for nm in item_names]
 
-    # Validate all items up front for a faster fail path
+    # Flatten all names for validation
+    flat_names = [nm for group in panel_defs for nm in group]
+    if len(set(flat_names)) != len(flat_names):
+        dupes = sorted({n for n in flat_names if flat_names.count(n) > 1})
+        raise ValueError(f"Duplicate item names not allowed: {dupes}")
+
+    # Validate all items up front
     missing = []
-    for nm in item_names:
+    for nm in flat_names:
         try:
             _find_item_index_exact(ds, nm)
         except ValueError:
@@ -251,23 +264,21 @@ def plot_dfs0_items_stacked(
     t, arr = _time_and_matrix(ds)
 
     # Precompute indices and series; detect radians and convert to degrees; compute unit labels
-    indices = [_find_item_index_exact(ds, nm) for nm in item_names]
-    ys = []
-    unit_labels = []
-    for i in indices:
+    indices_map = {nm: _find_item_index_exact(ds, nm) for nm in flat_names}
+    ys_map = {}
+    unit_label_map = {}
+    for nm, i in indices_map.items():
         unit_raw = getattr(ds.items[i], "unit", "")
         y_raw = arr[:, i]
         y_conv, unit_str = _convert_direction_if_radian(y_raw, unit_raw)
-        ys.append(y_conv)
-        unit_labels.append(_normalize_angle_unit_label(unit_str))
+        ys_map[nm] = y_conv
+        unit_label_map[nm] = _normalize_angle_unit_label(unit_str)
 
     # Build grouping key per series (identical plotting items share y-axis)
-    keys = []
     groups = {}
-    for k, i in enumerate(indices):
-        key = _canonical_group_key(ds, i, item_names[k], unit_labels[k])
-        keys.append(key)
-        groups.setdefault(key, []).append(k)
+    for nm in flat_names:
+        key = _canonical_group_key(ds, indices_map[nm], nm, unit_label_map[nm])
+        groups.setdefault(key, []).append(nm)
 
     # Compute a shared y-range for each group
     group_ranges = {}
@@ -275,8 +286,8 @@ def plot_dfs0_items_stacked(
     pads = {}
     for key, members in groups.items():
         try:
-            gmin = float(np.nanmin([np.nanmin(ys[m]) for m in members]))
-            gmax = float(np.nanmax([np.nanmax(ys[m]) for m in members]))
+            gmin = float(np.nanmin([np.nanmin(ys_map[m]) for m in members]))
+            gmax = float(np.nanmax([np.nanmax(ys_map[m]) for m in members]))
         except ValueError:
             gmin, gmax = 0.0, 1.0
         if not np.isfinite(gmin) or not np.isfinite(gmax):
@@ -292,7 +303,7 @@ def plot_dfs0_items_stacked(
     figs = []
     shared_x = None
 
-    n_plots = len(item_names)
+    n_plots = len(panel_defs)
 
     # Collect marker renderers for global on/off control
     marker_renderers = []
@@ -304,13 +315,25 @@ def plot_dfs0_items_stacked(
     x_axes = []
     y_axes = []
 
-    for k, name in enumerate(item_names):
-        idx = indices[k]
-        y = ys[k]
+    for pi, panel_names in enumerate(panel_defs):
+        # Ensure all items in this panel represent the same quantity/unit
+        panel_keys = { _canonical_group_key(ds, indices_map[nm], nm, unit_label_map[nm]) for nm in panel_names }
+        if len(panel_keys) != 1:
+            raise ValueError(
+                f"Panel {pi+1} contains items with different quantities/units. "
+                "Please group identical items per panel."
+            )
+        grp_key = next(iter(panel_keys))
 
-        # Unit already resolved (and converted to degrees if needed)
-        unit_str = unit_labels[k]
-        title = name if not unit_str else f"{name} ({unit_str})"
+        # Title and unit label
+        base_names = sorted({_base_item_name(nm) for nm in panel_names})
+        unit_str = unit_label_map[panel_names[0]]
+        if len(base_names) == 1:
+            title_base = base_names[0]
+        else:
+            title_base = " / ".join(base_names)
+        title = f"{title_base} ({unit_str})" if unit_str else title_base
+
         # Decide height: stretch when None
         eff_height = height_per_plot if height_per_plot is not None else min_height_per_plot
         p = figure(
@@ -323,7 +346,6 @@ def plot_dfs0_items_stacked(
             toolbar_location="right",
             margin=(4, 8, 4, 8),
         )
-        # Encourage max usage of space
         try:
             p.height_policy = "max"
             p.width_policy = "max"
@@ -339,34 +361,33 @@ def plot_dfs0_items_stacked(
         else:
             p.x_range = shared_x  # link x-axes
 
-        # Assign group-shared y-range for identical items
-        grp_key = keys[k]
+        # Assign y-range for this panel's group
         p.y_range = group_ranges[grp_key]
 
-        # Explicit ColumnDataSource for robust hover
-        source = ColumnDataSource(data={"x": t, "y": y})
-        color = palette[k % len(palette)]
-        r = p.line(
-            "x",
-            "y",
-            source=source,
-            line_width=line_width,
-            color=color,
-            legend_label=name if show_legend else None,
-        )
+        # Plot each series in the panel
+        for sj, nm in enumerate(panel_names):
+            y = ys_map[nm]
+            source = ColumnDataSource(data={"x": t, "y": y})
+            color = palette[sj % len(palette)]
+            r = p.line(
+                "x", "y", source=source, line_width=line_width, color=color,
+                legend_label=nm if show_legend else None,
+            )
+            m = p.scatter(
+                "x", "y", source=source, size=5, marker="circle", color=color, alpha=0.9,
+            )
+            m.visible = False
+            marker_renderers.append(m)
 
-        # Add markers (initially hidden); we'll wire a dropdown to toggle visibility
-        m = p.scatter(
-            "x",
-            "y",
-            source=source,
-            size=5,
-            marker="circle",
-            color=color,
-            alpha=0.9,
-        )
-        m.visible = False
-        marker_renderers.append(m)
+            # Hover per renderer
+            p.add_tools(
+                HoverTool(
+                    renderers=[r],
+                    tooltips=[("Time", f"@x{{{datetime_format}}}"), (nm, "@y")],
+                    formatters={"@x": "datetime"},
+                    mode="vline",
+                )
+            )
 
         # Axes & formatter
         p.xaxis.axis_label = "Time"
@@ -377,7 +398,6 @@ def plot_dfs0_items_stacked(
             months=datetime_format,
             years=datetime_format,
         )
-        # Apply initial font sizes
         for ax in list(p.xaxis) + list(p.yaxis):
             ax.axis_label_text_font_size = axis_label_font_size
             ax.major_label_text_font_size = tick_label_font_size
@@ -385,22 +405,10 @@ def plot_dfs0_items_stacked(
         if show_legend:
             p.legend.location = "top_left"
             p.legend.click_policy = "hide"
-        # Hide x-axis on all but the bottom subplot to reclaim height
-        if k < n_plots - 1:
+        if pi < n_plots - 1:
             p.xaxis.visible = False
             p.xgrid.visible = False
 
-        # Hover
-        p.add_tools(
-            HoverTool(
-                renderers=[r],
-                tooltips=[("Time", f"@x{{{datetime_format}}}"), (name, "@y")],
-                formatters={"@x": "datetime"},
-                mode="vline",
-            )
-        )
-
-        # Track axes for global font-size controls
         x_axes.extend(list(p.xaxis))
         y_axes.extend(list(p.yaxis))
 
@@ -410,8 +418,8 @@ def plot_dfs0_items_stacked(
     if show_y_range_menus:
         range_control_rows = []
         for key, members in groups.items():
-            label_core = item_names[members[0]].split(":", 1)[-1].strip()
-            unit_lbl = unit_labels[members[0]]
+            label_core = members[0].split(":", 1)[-1].strip()
+            unit_lbl = unit_label_map[members[0]]
             sel = Select(title=f"Y-range — {label_core} ({unit_lbl})", value="Auto", options=["Auto", "0..max", "Custom"])  
             min_input = TextInput(title="Min", value=f"{group_stats[key]['raw_min']:.6g}", visible=False)
             max_input = TextInput(title="Max", value=f"{group_stats[key]['raw_max']:.6g}", visible=False)
