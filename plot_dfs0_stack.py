@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
 from bokeh.plotting import figure, show
-from bokeh.layouts import column
-from bokeh.models import HoverTool, DatetimeTickFormatter, ColumnDataSource, Range1d, Select, CustomJS
+from bokeh.layouts import column, row
+from bokeh.models import HoverTool, DatetimeTickFormatter, ColumnDataSource, Range1d, Select, CustomJS, TextInput
 from bokeh.embed import file_html
 from bokeh.resources import INLINE
 import webbrowser
@@ -204,6 +204,11 @@ def plot_dfs0_items_stacked(
     show_legend=True,
     datetime_format="%d/%m/%Y %H:%M:%S",
     palette=("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"),
+    show_marker_menu=True,
+    show_y_range_menus=True,
+    show_font_menus=True,
+    axis_label_font_size="12pt",
+    tick_label_font_size="10pt",
 ):
     """
     Plot multiple dfs0 items (exact names) as stacked subplots with a shared x-range.
@@ -220,6 +225,11 @@ def plot_dfs0_items_stacked(
     show_legend : bool       Show/hide legend on each subplot
     datetime_format : str    Bokeh datetime format string for x-axis and hover
     palette : tuple[str]     Colors to cycle (even if 1 series/plot, future-proof)
+    show_marker_menu : bool   Show the global marker On/Off dropdown
+    show_y_range_menus : bool Show per-item-group Y-axis range controls
+    show_font_menus : bool    Show axis/tick font size dropdowns
+    axis_label_font_size : str Initial axis label font size (e.g., "12pt")
+    tick_label_font_size : str Initial tick label font size (e.g., "10pt")
     """
     if not item_names:
         raise ValueError("item_names cannot be empty")
@@ -261,6 +271,8 @@ def plot_dfs0_items_stacked(
 
     # Compute a shared y-range for each group
     group_ranges = {}
+    group_stats = {}
+    pads = {}
     for key, members in groups.items():
         try:
             gmin = float(np.nanmin([np.nanmin(ys[m]) for m in members]))
@@ -273,7 +285,9 @@ def plot_dfs0_items_stacked(
             gmin -= 0.5
             gmax += 0.5
         pad = (gmax - gmin) * 0.05
+        pads[key] = pad
         group_ranges[key] = Range1d(start=gmin - pad, end=gmax + pad)
+        group_stats[key] = dict(raw_min=gmin, raw_max=gmax)
 
     figs = []
     shared_x = None
@@ -282,6 +296,13 @@ def plot_dfs0_items_stacked(
 
     # Collect marker renderers for global on/off control
     marker_renderers = []
+
+    # Optional UI controls container
+    control_widgets = []
+
+    # Collect all axes across figures for font-size controls
+    x_axes = []
+    y_axes = []
 
     for k, name in enumerate(item_names):
         idx = indices[k]
@@ -356,6 +377,10 @@ def plot_dfs0_items_stacked(
             months=datetime_format,
             years=datetime_format,
         )
+        # Apply initial font sizes
+        for ax in list(p.xaxis) + list(p.yaxis):
+            ax.axis_label_text_font_size = axis_label_font_size
+            ax.major_label_text_font_size = tick_label_font_size
 
         if show_legend:
             p.legend.location = "top_left"
@@ -375,7 +400,72 @@ def plot_dfs0_items_stacked(
             )
         )
 
+        # Track axes for global font-size controls
+        x_axes.extend(list(p.xaxis))
+        y_axes.extend(list(p.yaxis))
+
         figs.append(p)
+
+    # Y-axis range controls per item group (optional)
+    if show_y_range_menus:
+        range_control_rows = []
+        for key, members in groups.items():
+            label_core = item_names[members[0]].split(":", 1)[-1].strip()
+            unit_lbl = unit_labels[members[0]]
+            sel = Select(title=f"Y-range — {label_core} ({unit_lbl})", value="Auto", options=["Auto", "0..max", "Custom"])  
+            min_input = TextInput(title="Min", value=f"{group_stats[key]['raw_min']:.6g}", visible=False)
+            max_input = TextInput(title="Max", value=f"{group_stats[key]['raw_max']:.6g}", visible=False)
+            cb = CustomJS(args=dict(
+                rng=group_ranges[key], sel=sel, minInput=min_input, maxInput=max_input,
+                autoMin=group_stats[key]['raw_min']-pads[key], autoMax=group_stats[key]['raw_max']+pads[key],
+                zeroMax=max(0.0, group_stats[key]['raw_max']+pads[key])
+            ), code="""
+                const mode = sel.value;
+                const isCustom = (mode === 'Custom');
+                minInput.visible = isCustom;
+                maxInput.visible = isCustom;
+                let lo = rng.start;
+                let hi = rng.end;
+                if (mode === 'Auto') {
+                    lo = autoMin; hi = autoMax;
+                } else if (mode === '0..max') {
+                    lo = 0.0; hi = zeroMax;
+                } else {
+                    const vmin = parseFloat(minInput.value);
+                    const vmax = parseFloat(maxInput.value);
+                    if (!Number.isNaN(vmin) && !Number.isNaN(vmax) && vmax > vmin) {
+                        lo = vmin; hi = vmax;
+                    } else { return; }
+                }
+                rng.start = lo;
+                rng.end = hi;
+            """)
+            sel.js_on_change("value", cb)
+            min_input.js_on_change("value", cb)
+            max_input.js_on_change("value", cb)
+            range_control_rows.append(row(sel, min_input, max_input))
+        control_widgets.extend(range_control_rows)
+
+    # Axis/tick font size controls (optional)
+    if show_font_menus:
+        size_opts = ["8pt","9pt","10pt","11pt","12pt","14pt","16pt","18pt","20pt"]
+        label_size_select = Select(title="Axis label font size", value=axis_label_font_size, options=size_opts)
+        tick_size_select = Select(title="Tick label font size", value=tick_label_font_size, options=size_opts)
+        cb_fonts = CustomJS(args=dict(x_axes=x_axes, y_axes=y_axes, labelSel=label_size_select, tickSel=tick_size_select), code="""
+            const labelSize = labelSel.value;
+            const tickSize = tickSel.value;
+            function apply(axArr){
+                for (const ax of axArr){
+                    ax.axis_label_text_font_size = labelSize;
+                    ax.major_label_text_font_size = tickSize;
+                }
+            }
+            apply(x_axes);
+            apply(y_axes);
+        """)
+        label_size_select.js_on_change("value", cb_fonts)
+        tick_size_select.js_on_change("value", cb_fonts)
+        control_widgets.append(row(label_size_select, tick_size_select))
 
     # Dropdown to switch markers on/off
     marker_select = Select(title="Markers", value="Off", options=["Off", "On"]) 
@@ -385,6 +475,9 @@ def plot_dfs0_items_stacked(
     """)
     marker_select.js_on_change("value", marker_callback)
 
-    layout = column(marker_select, *figs, sizing_mode="stretch_both")
+    if show_marker_menu:
+        control_widgets.append(marker_select)
+
+    layout = column(*(control_widgets + figs), sizing_mode="stretch_both")
     show(layout)
     return layout
