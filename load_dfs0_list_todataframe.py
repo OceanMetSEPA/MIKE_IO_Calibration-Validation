@@ -10,17 +10,19 @@ class Dfs0File:
     """
     Wrapper for a single dfs0 file where each column (and datetime) is dot-accessible.
 
-    Example:
-        bundle.myfile.datetime
-        bundle.myfile.sur_current_speed
-        bundle.myfile.parameters
-            -> {'sur: Current speed': 'sur_current_speed', ...}
+    Access patterns:
+        - Dot access (sanitized):  bundle.maob1.sur_current_speed
+        - Index by original name:  bundle.maob1["sur: Current speed"]
+        - Datetime index:          bundle.maob1.datetime
+        - Mapping:                 bundle.maob1.parameters  # {original: sanitized}
+        - Full DataFrame:          bundle.maob1.dataframe
+        - Table of params:         bundle.maob1.show_parameters()
     """
 
     def __init__(self, name: str, df: pd.DataFrame):
         self._name = name
         self._df = df
-        self.parameters = {}  # mapping original -> sanitized attribute name
+        self.parameters: dict[str, str] = {}  # original -> sanitized attribute name
 
         # expose datetime index
         setattr(self, "datetime", df.index)
@@ -37,7 +39,7 @@ class Dfs0File:
                 i += 1
             setattr(self, safe, df[col])
             used.add(safe)
-            self.parameters[col] = safe  # store mapping
+            self.parameters[str(col)] = safe  # store mapping from original -> sanitized
 
     @staticmethod
     def _sanitize(name: str) -> str:
@@ -55,6 +57,45 @@ class Dfs0File:
     def dataframe(self) -> pd.DataFrame:
         """Access the full DataFrame if needed."""
         return self._df
+
+    # Dict-like access by original name (or sanitized name)
+    def __getitem__(self, key: str):
+        """
+        Get a pandas Series by:
+          - original dfs0 item name (exact match), e.g. "sur: Current direction (Horizontal)"
+          - OR the sanitized name used for dot access, e.g. "sur_current_direction_horizontal"
+        """
+        if key in self.parameters:
+            return getattr(self, self.parameters[key])
+        if hasattr(self, key):
+            return getattr(self, key)
+        available = list(self.parameters.keys())
+        raise KeyError(
+            f"Parameter '{key}' not found. "
+            f"Try one of the original names: {available[:10]}{' ...' if len(available)>10 else ''}"
+        )
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.parameters or hasattr(self, key)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def show_parameters(self) -> pd.DataFrame:
+        """
+        Print a neat table mapping original dfs0 names to dot-access names.
+        Returns the DataFrame for further use.
+        """
+        table = pd.DataFrame(
+            [(orig, dot) for orig, dot in self.parameters.items()],
+            columns=["Original name", "Dot-access name"],
+        ).sort_values("Original name", kind="stable", ignore_index=True)
+        # Pretty print without the pandas index
+        print(table.to_string(index=False))
+        return table
 
     def __repr__(self):
         return f"<Dfs0File {self._name} with {len(self._df.columns)} parameters>"
@@ -90,7 +131,7 @@ class Dfs0Bundle:
 def load_dfs0s_to_dataframe(file_list):
     """
     Load multiple dfs0 files into pandas DataFrames.
-    Returns a Dfs0Bundle where each file exposes its parameters via dot-access.
+    Returns a Dfs0Bundle where each file exposes its parameters via dot-access and original-name indexing.
 
     Parameters
     ----------
@@ -100,17 +141,12 @@ def load_dfs0s_to_dataframe(file_list):
     Returns
     -------
     Dfs0Bundle
-        Access like: bundle.<filename_stem>.datetime, bundle.<filename_stem>.<parameter>
-        Also check bundle.<filename_stem>.parameters for mapping.
-
-    Example
-    -------
-    >>> bundle = load_dfs0s_to_dataframe([Path("MAOB1.dfs0")])
-    >>> bundle.maob1.datetime
-    >>> bundle.maob1.sur_current_speed
-    >>> bundle.maob1.parameters
-        {'sur: Current speed': 'sur_current_speed',
-         'sur: Current direction (Horizontal)': 'sur_current_direction_horizontal'}
+        Access like:
+          - bundle.<filename_stem>.datetime
+          - bundle.<filename_stem>.<sanitized_parameter>
+          - bundle.<filename_stem>["<original parameter name>"]
+        See mapping via bundle.<filename_stem>.parameters (original -> sanitized).
+        Print a readable table via bundle.<filename_stem>.show_parameters()
     """
     bundle = Dfs0Bundle()
     for f in file_list:
@@ -123,7 +159,7 @@ def load_dfs0s_to_dataframe(file_list):
             df = ds.to_dataframe()
             key = p.stem.lower()  # filename stem as attribute name
             bundle.add(key, df)
-            print(f"✅ Loaded: {p.name} → access with bundle.{key}.<parameter>")
+            print(f"✅ Loaded: {p.name} → access with bundle.{key}.<parameter> or bundle.{key}[\"<original>\"]")
         except Exception as e:
             print(f"❌ Error loading {p}: {e}")
     return bundle

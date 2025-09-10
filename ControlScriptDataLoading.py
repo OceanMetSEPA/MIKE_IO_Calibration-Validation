@@ -43,13 +43,18 @@ bundle = load_dfs0s_to_dataframe(dfs0_files)
 
 
 #%%
-# Example usage
-print(bundle)
-print(bundle.maob1.datetime)
-print(bundle.maob1.dataframe.columns)
+# Dot access (sanitized):
+speed = bundle.maob1.sur_current_speed
+direction = bundle.maob1.sur_current_direction_horizontal
 
+# Index by original name:
+speed2 = bundle.maob1["sur: Current speed"]
+direction2 = bundle.maob1["sur: Current direction (Horizontal)"]
 
-test=bundle.maob1.datetime
+# Mapping (original -> sanitized):
+print(bundle.maob1.parameters)
+
+bundle.maob1.show_parameters()
 
 #%%
 # dot access
